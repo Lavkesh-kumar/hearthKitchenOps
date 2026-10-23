@@ -1,0 +1,7 @@
+body {
+  font-family: sans-serif;
+  margin: 0;
+  padding: 0;
+}
+table { width: 100%; }
+button { cursor: pointer; padding: 0.3rem 0.7rem; }
