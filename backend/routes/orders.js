@@ -112,32 +112,62 @@ router.post('/:id/release', async (req, res) => {
       [order.batches, order.recipe_id]
     );
 
-    const shortfalls = reqs.filter(r => parseFloat(r.available) < parseFloat(r.total_required));
+    // Load substitutes for ingredients in this order and lock them
+    const { rows: substitutes } = await client.query(
+      `SELECT s.primary_ingredient_id, i.id AS sub_id, i.name AS sub_name, i.unit AS sub_unit,
+              (i.on_hand - i.reserved) AS available
+       FROM ingredient_substitutes s
+       JOIN ingredients i ON i.id = s.substitute_ingredient_id
+       WHERE s.primary_ingredient_id = ANY($1::int[])
+       FOR UPDATE OF i`,
+      [reqs.map(r => r.id)]
+    );
+    const subMap = {};
+    for (const s of substitutes) subMap[s.primary_ingredient_id] = s;
+
+    // Determine what to reserve; use substitute to cover butter shortfall
+    const toReserve = [];
+    const shortfalls = [];
+
+    for (const r of reqs) {
+      const required = parseFloat(r.total_required);
+      const available = parseFloat(r.available);
+      if (available >= required) {
+        toReserve.push({ id: r.id, name: r.name, unit: r.unit, quantity: required });
+      } else {
+        const gap = required - available;
+        const sub = subMap[r.id];
+        if (sub && parseFloat(sub.available) >= gap) {
+          if (available > 0) toReserve.push({ id: r.id, name: r.name, unit: r.unit, quantity: available });
+          toReserve.push({ id: sub.sub_id, name: sub.sub_name, unit: sub.sub_unit, quantity: gap });
+        } else {
+          shortfalls.push({ ingredient: r.name, unit: r.unit, required, available, shortfall: gap });
+        }
+      }
+    }
 
     if (shortfalls.length > 0) {
       await client.query('ROLLBACK');
-      return res.status(422).json({
-        error: 'Insufficient stock',
-        shortfalls: shortfalls.map(s => ({
-          ingredient: s.name,
-          unit: s.unit,
-          required: parseFloat(s.total_required),
-          available: parseFloat(s.available),
-          shortfall: parseFloat(s.total_required) - parseFloat(s.available),
-        })),
-      });
+      return res.status(422).json({ error: 'Insufficient stock', shortfalls });
     }
 
-    // Reserve stock and record movements
-    for (const req_ of reqs) {
+    // Reserve stock, record movements and order_reservations
+    for (const item of toReserve) {
       await client.query(
         `UPDATE ingredients SET reserved = reserved + $1 WHERE id = $2`,
-        [req_.total_required, req_.id]
+        [item.quantity, item.id]
       );
       await client.query(
         `INSERT INTO stock_movements (ingredient_id, order_id, movement_type, quantity)
          VALUES ($1, $2, 'reserve', $3)`,
-        [req_.id, order.id, req_.total_required]
+        [item.id, order.id, item.quantity]
+      );
+      await client.query(
+        `INSERT INTO order_reservations (order_id, ingredient_id, quantity)
+         VALUES ($1, $2, $3)
+         ON CONFLICT (order_id, ingredient_id) DO UPDATE
+         SET quantity = order_reservations.quantity + EXCLUDED.quantity`,
+        [order.id, item.id, item.quantity]
       );
     }
 
@@ -174,26 +204,24 @@ router.post('/:id/complete', async (req, res) => {
     const order = orderRows[0];
     if (order.status !== 'released') { await client.query('ROLLBACK'); return res.status(400).json({ error: `Cannot complete an order with status '${order.status}'` }); }
 
-    const { rows: reqs } = await client.query(
-      `SELECT i.id, ri.quantity_per_batch * $1 AS total_required
-       FROM recipe_ingredients ri
-       JOIN ingredients i ON i.id = ri.ingredient_id
-       WHERE ri.recipe_id = $2 FOR UPDATE OF i`,
-      [order.batches, order.recipe_id]
+    // Use order_reservations so we consume exactly what was reserved (incl. substitutes)
+    const { rows: reservations } = await client.query(
+      `SELECT ingredient_id, quantity FROM order_reservations WHERE order_id = $1`,
+      [order.id]
     );
-
-    for (const req_ of reqs) {
-      // Deduct on_hand and clear reserved
+    await client.query(
+      `SELECT id FROM ingredients WHERE id = ANY($1::int[]) FOR UPDATE`,
+      [reservations.map(r => r.ingredient_id)]
+    );
+    for (const res_ of reservations) {
       await client.query(
-        `UPDATE ingredients
-         SET on_hand = on_hand - $1, reserved = reserved - $1
-         WHERE id = $2`,
-        [req_.total_required, req_.id]
+        `UPDATE ingredients SET on_hand = on_hand - $1, reserved = reserved - $1 WHERE id = $2`,
+        [res_.quantity, res_.ingredient_id]
       );
       await client.query(
         `INSERT INTO stock_movements (ingredient_id, order_id, movement_type, quantity)
          VALUES ($1, $2, 'consume', $3)`,
-        [req_.id, order.id, req_.total_required]
+        [res_.ingredient_id, order.id, res_.quantity]
       );
     }
 
@@ -235,23 +263,24 @@ router.post('/:id/cancel', async (req, res) => {
 
     // Only free reserved stock if it was released
     if (order.status === 'released') {
-      const { rows: reqs } = await client.query(
-        `SELECT i.id, ri.quantity_per_batch * $1 AS total_required
-         FROM recipe_ingredients ri
-         JOIN ingredients i ON i.id = ri.ingredient_id
-         WHERE ri.recipe_id = $2 FOR UPDATE OF i`,
-        [order.batches, order.recipe_id]
+      // Use order_reservations so we free exactly what was reserved (incl. substitutes)
+      const { rows: reservations } = await client.query(
+        `SELECT ingredient_id, quantity FROM order_reservations WHERE order_id = $1`,
+        [order.id]
       );
-
-      for (const req_ of reqs) {
+      await client.query(
+        `SELECT id FROM ingredients WHERE id = ANY($1::int[]) FOR UPDATE`,
+        [reservations.map(r => r.ingredient_id)]
+      );
+      for (const res_ of reservations) {
         await client.query(
           `UPDATE ingredients SET reserved = reserved - $1 WHERE id = $2`,
-          [req_.total_required, req_.id]
+          [res_.quantity, res_.ingredient_id]
         );
         await client.query(
           `INSERT INTO stock_movements (ingredient_id, order_id, movement_type, quantity)
            VALUES ($1, $2, 'release', $3)`,
-          [req_.id, order.id, req_.total_required]
+          [res_.ingredient_id, order.id, res_.quantity]
         );
       }
     }

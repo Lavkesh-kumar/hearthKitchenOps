@@ -3,7 +3,7 @@ INSERT INTO ingredients (name, unit, on_hand) VALUES
   ('Flour',     'kg',  50),
   ('Sugar',     'kg',  20),
   ('Butter',    'kg',   8),
-  ('Eggs',      'pcs', 120),
+  ('Eggs',      'pcs', 1200),
   ('Milk',      'L',   15),
   ('Yeast',     'kg',   0.5),
   ('Salt',      'kg',   5),
