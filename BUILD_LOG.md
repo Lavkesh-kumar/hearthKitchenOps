@@ -1,7 +1,7 @@
 # Build Log
 
-**Name:** Hearth Kitchen Ops Developer
-**Repository URL:** https://github.com/your-username/HearthKitchenOps
+**Name:** Lavkesh Kumar
+**Repository URL:** https://github.com/Lavkesh-kumar/hearthKitchenOps
 **Start (date and time):** 2025-07-14 14:00
 **End (date and time):** 2025-07-14 17:00
 **Total working time:** ~3 hours
